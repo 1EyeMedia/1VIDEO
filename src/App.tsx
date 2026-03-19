@@ -40,7 +40,8 @@ import {
   Shield,
   Monitor,
   Settings,
-  MoreVertical
+  MoreVertical,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { auth, db, googleProvider } from './firebase';
@@ -166,37 +167,89 @@ const VideoTile = ({
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
+    const video = videoRef.current;
+    if (video && stream) {
+      console.log(`VideoTile [${participant.name}]: Stream updated`, {
+        id: stream.id,
+        audioTracks: stream.getAudioTracks().length,
+        videoTracks: stream.getVideoTracks().length,
+        isVideoOff: participant.isVideoOff,
+        isMuted: participant.isMuted
+      });
+
+      if (video.srcObject !== stream) {
+        video.srcObject = stream;
+      }
+
+      // Ensure video is playing
+      const playVideo = () => {
+        video.play().catch(err => {
+          if (err.name !== 'AbortError') {
+            console.warn(`Video play failed for ${participant.name}:`, err);
+          }
+        });
+      };
+
+      playVideo();
+      
+      // Some browsers need a nudge when the track becomes enabled again
+      const handleTrackEnabled = () => {
+        console.log(`Track enabled for ${participant.name}, nudging video...`);
+        playVideo();
+      };
+
+      stream.getTracks().forEach(track => {
+        track.addEventListener('unmute', handleTrackEnabled);
+      });
+
+      return () => {
+        stream.getTracks().forEach(track => {
+          track.removeEventListener('unmute', handleTrackEnabled);
+        });
+      };
     }
-  }, [stream]);
+  }, [stream, participant.name, participant.isVideoOff]);
+
+  // Nudge play when video is turned back on
+  useEffect(() => {
+    if (!participant.isVideoOff && videoRef.current && stream) {
+      videoRef.current.play().catch(err => {
+        if (err.name !== 'AbortError') {
+          console.warn(`Video nudge play failed for ${participant.name}:`, err);
+        }
+      });
+    }
+  }, [participant.isVideoOff, stream, participant.name]);
 
   return (
     <div className="relative aspect-video bg-neutral-900 rounded-2xl overflow-hidden border border-white/5 group shadow-2xl">
-      {participant.isVideoOff ? (
-        <div className="absolute inset-0 flex items-center justify-center bg-neutral-900">
-          <div className="w-20 h-20 rounded-full bg-neutral-800 flex items-center justify-center border border-white/10 overflow-hidden">
-             {participant.photoURL ? (
-               <img src={participant.photoURL} alt={participant.name} className="w-full h-full object-cover" />
-             ) : (
-               <span className="text-2xl font-bold text-neutral-500">{participant.name[0]}</span>
-             )}
-          </div>
+      {/* Avatar Overlay - Shown when video is off */}
+      <div className={cn(
+        "absolute inset-0 flex items-center justify-center bg-neutral-900 transition-opacity duration-300 z-10",
+        participant.isVideoOff ? "opacity-100" : "opacity-0 pointer-events-none"
+      )}>
+        <div className="w-20 h-20 rounded-full bg-neutral-800 flex items-center justify-center border border-white/10 overflow-hidden">
+           {participant.photoURL ? (
+             <img src={participant.photoURL} alt={participant.name} className="w-full h-full object-cover" />
+           ) : (
+             <span className="text-2xl font-bold text-neutral-500">{participant.name[0]}</span>
+           )}
         </div>
-      ) : (
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted={isLocal}
-          className={cn(
-            "w-full h-full object-cover",
-            isLocal && "scale-x-[-1]"
-          )}
-        />
-      )}
+      </div>
+
+      {/* Video Element - Always present to maintain audio track */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={isLocal}
+        className={cn(
+          "w-full h-full object-cover",
+          isLocal && "scale-x-[-1]"
+        )}
+      />
       
-      <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-black/40 backdrop-blur-md rounded-lg border border-white/10">
+      <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-black/40 backdrop-blur-md rounded-lg border border-white/10 z-20">
         <span className="text-xs font-medium text-white/90">
           {participant.name} {isLocal && "(You)"}
         </span>
@@ -340,9 +393,12 @@ export default function App() {
     const unsubscribe = onSnapshot(q, (snapshot) => {
       try {
         const parts: Participant[] = [];
+        const currentPeerIds = new Set<string>();
+
         snapshot.forEach((doc) => {
           const data = doc.data() as Participant;
           parts.push({ id: doc.id, ...data });
+          if (data.peerId) currentPeerIds.add(data.peerId);
           
           // Call new participants
           if (peer.open && data.peerId && data.peerId !== peer.id && !callsRef.current[data.peerId]) {
@@ -362,7 +418,32 @@ export default function App() {
             }
           }
         });
+
         setParticipants(parts);
+
+        // Cleanup remote streams and calls for participants who left
+        setRemoteStreams(prev => {
+          const next = { ...prev };
+          let changed = false;
+          Object.keys(next).forEach(id => {
+            if (!currentPeerIds.has(id)) {
+              console.log(`Cleaning up remote stream for peer: ${id}`);
+              delete next[id];
+              changed = true;
+            }
+          });
+          return changed ? next : prev;
+        });
+
+        // Also cleanup callsRef
+        Object.keys(callsRef.current).forEach(id => {
+          if (!currentPeerIds.has(id)) {
+            console.log(`Closing call for peer: ${id}`);
+            callsRef.current[id].close();
+            delete callsRef.current[id];
+          }
+        });
+
       } catch (err) {
         console.error("Error in onSnapshot listener:", err);
       }
@@ -466,9 +547,21 @@ export default function App() {
             height: { ideal: 720 },
             facingMode: "user"
           }, 
-          audio: true 
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
         });
-        console.log("Media access granted");
+        
+        // Explicitly enable all tracks
+        stream.getTracks().forEach(track => {
+          track.enabled = true;
+          console.log(`Track ${track.kind} enabled: ${track.enabled}`);
+        });
+        
+        console.log("Media access granted. Audio tracks:", stream.getAudioTracks().length);
+        console.log("Media access granted. Video tracks:", stream.getVideoTracks().length);
       } catch (err: any) {
         console.error("Media Access Error:", err);
         if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
@@ -538,16 +631,19 @@ export default function App() {
   const toggleMute = () => {
     if (localStream) {
       const audioTrack = localStream.getAudioTracks()[0];
-      audioTrack.enabled = !audioTrack.enabled;
-      setIsMuted(!audioTrack.enabled);
-      
-      if (room && user) {
-        try {
-          updateDoc(doc(db, 'rooms', room.id, 'participants', user.uid), {
-            isMuted: !audioTrack.enabled
-          });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.id}/participants/${user.uid}`);
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled;
+        setIsMuted(!audioTrack.enabled);
+        console.log("Audio toggled. Enabled:", audioTrack.enabled);
+        
+        if (room && user) {
+          try {
+            updateDoc(doc(db, 'rooms', room.id, 'participants', user.uid), {
+              isMuted: !audioTrack.enabled
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.id}/participants/${user.uid}`);
+          }
         }
       }
     }
@@ -556,18 +652,57 @@ export default function App() {
   const toggleVideo = () => {
     if (localStream) {
       const videoTrack = localStream.getVideoTracks()[0];
-      videoTrack.enabled = !videoTrack.enabled;
-      setIsVideoOff(!videoTrack.enabled);
-      
-      if (room && user) {
-        try {
-          updateDoc(doc(db, 'rooms', room.id, 'participants', user.uid), {
-            isVideoOff: !videoTrack.enabled
-          });
-        } catch (err) {
-          handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.id}/participants/${user.uid}`);
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled;
+        setIsVideoOff(!videoTrack.enabled);
+        console.log("Video toggled. Enabled:", videoTrack.enabled);
+        
+        if (room && user) {
+          try {
+            updateDoc(doc(db, 'rooms', room.id, 'participants', user.uid), {
+              isVideoOff: !videoTrack.enabled
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.UPDATE, `rooms/${room.id}/participants/${user.uid}`);
+          }
         }
       }
+    }
+  };
+
+  const refreshMedia = async () => {
+    if (!room || !user) return;
+    setToast("Refreshing media connection...");
+    
+    try {
+      // Stop old tracks
+      if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+      }
+      
+      // Get new stream
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: "user"
+        }, 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      
+      // Apply current mute/video settings to new stream
+      stream.getAudioTracks().forEach(track => track.enabled = !isMuted);
+      stream.getVideoTracks().forEach(track => track.enabled = !isVideoOff);
+      
+      setLocalStream(stream);
+      setToast("Media refreshed successfully.");
+    } catch (err: any) {
+      console.error("Error refreshing media:", err);
+      setToast(`Failed to refresh media: ${err.message}`);
     }
   };
 
@@ -690,7 +825,7 @@ export default function App() {
                   exit={{ opacity: 0, scale: 0.95 }}
                 >
                   <VideoTile 
-                    participant={p} 
+                    participant={p.userId === user.uid ? { ...p, isVideoOff, isMuted } : p} 
                     stream={p.userId === user.uid ? localStream : remoteStreams[p.peerId]} 
                     isLocal={p.userId === user.uid}
                   />
@@ -743,6 +878,14 @@ export default function App() {
             onClick={toggleVideo}
           >
             {isVideoOff ? <VideoOff className="w-6 h-6" /> : <Video className="w-6 h-6" />}
+          </Button>
+
+          <Button 
+            variant="secondary" 
+            className="w-14 h-14 rounded-2xl"
+            onClick={refreshMedia}
+          >
+            <RefreshCw className="w-6 h-6" />
           </Button>
 
           <Button 
