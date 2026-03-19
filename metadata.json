@@ -1,0 +1,8 @@
+{
+  "name": "Nexus Video",
+  "description": "A premium, white-labeled video calling application with seamless Google integration.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
