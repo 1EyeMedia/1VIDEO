@@ -8,7 +8,8 @@ import {
   signInWithPopup, 
   onAuthStateChanged, 
   signOut, 
-  User as FirebaseUser 
+  User as FirebaseUser,
+  browserPopupRedirectResolver
 } from 'firebase/auth';
 import { 
   doc, 
@@ -253,10 +254,12 @@ export default function App() {
   }, []);
 
   const login = async () => {
+    setError(null);
     try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err) {
-      setError("Failed to sign in with Google.");
+      await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
+    } catch (err: any) {
+      console.error("Login Error:", err);
+      setError(`Login failed: ${err.message || "Unknown error"}. Please ensure popups are allowed and the domain is authorized in Firebase.`);
     }
   };
 
@@ -446,6 +449,16 @@ export default function App() {
             <LogIn className="w-5 h-5" />
             Connect with Google
           </Button>
+
+          {error && (
+            <motion.p 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="text-red-500 text-sm bg-red-500/10 p-4 rounded-xl border border-red-500/20"
+            >
+              {error}
+            </motion.p>
+          )}
 
           <div className="pt-8 border-t border-white/5 flex justify-center gap-8 opacity-40 grayscale">
              <Shield className="w-6 h-6" />
