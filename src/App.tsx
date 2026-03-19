@@ -227,6 +227,7 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [roomInput, setRoomInput] = useState('');
   const [isJoining, setIsJoining] = useState(false);
+  const [isPeerConnected, setIsPeerConnected] = useState(false);
 
   const peerRef = useRef<Peer | null>(null);
   const callsRef = useRef<Record<string, MediaConnection>>({});
@@ -281,41 +282,45 @@ export default function App() {
 
   const startMeeting = async () => {
     if (!user) return;
+    setIsJoining(true);
+    setError(null);
     const roomId = Math.random().toString(36).substring(2, 10);
     const roomRef = doc(db, 'rooms', roomId);
     try {
+      console.log("Creating room:", roomId);
       await setDoc(roomRef, {
         name: `${user.displayName}'s Meeting`,
         hostId: user.uid,
         createdAt: serverTimestamp(),
         active: true
       });
+      console.log("Room created successfully");
+      await joinRoom(roomId);
     } catch (err) {
+      console.error("Error creating room:", err);
       handleFirestoreError(err, OperationType.WRITE, `rooms/${roomId}`);
+      setIsJoining(false);
     }
-    joinRoom(roomId);
   };
 
   const joinRoom = async (roomId: string) => {
     if (!roomId.trim()) return;
     setIsJoining(true);
     setError(null);
+    console.log("Attempting to join room:", roomId);
+
     try {
-      let roomSnap;
-      try {
-        roomSnap = await getDoc(doc(db, 'rooms', roomId));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.GET, `rooms/${roomId}`);
-        setIsJoining(false);
-        return;
-      }
-      
+      // 1. Fetch Room Data
+      const roomSnap = await getDoc(doc(db, 'rooms', roomId));
       if (!roomSnap.exists()) {
         setError("Room not found. Please check the code.");
         setIsJoining(false);
         return;
       }
+      const roomData = roomSnap.data() as Room;
+      console.log("Room data fetched:", roomData);
 
+      // 2. Get User Media
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         setError("Your browser does not support video calling. Please use a modern browser like Chrome or Firefox.");
         setIsJoining(false);
@@ -324,6 +329,7 @@ export default function App() {
 
       let stream: MediaStream;
       try {
+        console.log("Requesting media access...");
         stream = await navigator.mediaDevices.getUserMedia({ 
           video: {
             width: { ideal: 1280 },
@@ -332,6 +338,7 @@ export default function App() {
           }, 
           audio: true 
         });
+        console.log("Media access granted");
       } catch (err: any) {
         console.error("Media Access Error:", err);
         if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
@@ -340,33 +347,36 @@ export default function App() {
           setError("No camera or microphone found. Please connect a device and try again.");
         } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
           setError("Could not start video source. Your camera might be in use by another application (like Zoom or Teams). Please close other apps and try again.");
-        } else if (err.name === 'OverconstrainedError') {
-          setError("Your camera does not support the required resolution. Trying with default settings...");
-          try {
-            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-            setLocalStream(stream);
-            // Continue with the rest of the logic...
-          } catch (fallbackErr) {
-            setError("Could not access camera even with default settings.");
-            setIsJoining(false);
-            return;
-          }
         } else {
           setError(`Media Error: ${err.message || "Could not access camera/microphone"}`);
         }
-        
-        if (!stream!) {
-          setIsJoining(false);
-          return;
-        }
+        setIsJoining(false);
+        return;
       }
       
       setLocalStream(stream);
 
+      // 3. Set Room State Immediately (Show Interface)
+      setRoom({ id: roomId, ...roomData });
+      setIsJoining(false); // Stop buffering on dashboard
+
+      // 4. Initialize PeerJS and Register Participant in Background
+      console.log("Initializing PeerJS...");
       const peer = new Peer();
       peerRef.current = peer;
 
+      const peerTimeout = setTimeout(() => {
+        if (!peer.open) {
+          console.error("PeerJS connection timeout");
+          setError("Connection timeout. Please check your internet connection.");
+          // Don't leave room, just show error
+        }
+      }, 15000);
+
       peer.on('open', async (id) => {
+        clearTimeout(peerTimeout);
+        console.log("PeerJS opened with ID:", id);
+        setIsPeerConnected(true);
         const participantRef = doc(db, 'rooms', roomId, 'participants', user!.uid);
         try {
           await setDoc(participantRef, {
@@ -378,18 +388,16 @@ export default function App() {
             isVideoOff: false,
             joinedAt: serverTimestamp()
           });
+          console.log("Participant registered in Firestore");
         } catch (err) {
+          console.error("Error registering participant:", err);
           handleFirestoreError(err, OperationType.WRITE, `rooms/${roomId}/participants/${user!.uid}`);
         }
-
-        setRoom({ id: roomId, ...roomSnap.data() } as Room);
-        setIsJoining(false);
       });
 
       peer.on('error', (err) => {
         console.error("PeerJS Error:", err);
-        setError(`Connection error: ${err.type}`);
-        setIsJoining(false);
+        setError(`Connection error: ${err.type}. PeerJS signaling might be blocked.`);
       });
 
       peer.on('call', (call) => {
@@ -418,7 +426,7 @@ export default function App() {
             parts.push({ id: doc.id, ...data });
             
             // Call new participants
-            if (data.peerId !== peer.id && !callsRef.current[data.peerId]) {
+            if (data.peerId && data.peerId !== peer.id && !callsRef.current[data.peerId]) {
               console.log(`Calling participant: ${data.name} (${data.peerId})`);
               try {
                 const call = peer.call(data.peerId, stream);
@@ -445,8 +453,9 @@ export default function App() {
       unsubscribeRef.current = unsubscribe;
 
     } catch (err) {
-      console.error(err);
-      setError("Could not access camera/microphone.");
+      console.error("General Join Error:", err);
+      setError("An unexpected error occurred while joining the room.");
+      setIsJoining(false);
     }
   };
 
@@ -482,6 +491,7 @@ export default function App() {
       setRoom(null);
       setParticipants([]);
       setRemoteStreams({});
+      setIsPeerConnected(false);
       callsRef.current = {};
     }
   };
@@ -608,7 +618,15 @@ export default function App() {
         </header>
 
         {/* Video Grid */}
-        <main className="flex-1 p-6 overflow-y-auto">
+        <main className="flex-1 p-6 overflow-y-auto relative">
+          {!isPeerConnected && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+              <div className="text-center space-y-4">
+                <div className="w-12 h-12 border-4 border-white/10 border-t-white rounded-full animate-spin mx-auto" />
+                <p className="text-sm text-neutral-400 animate-pulse">Establishing secure connection...</p>
+              </div>
+            </div>
+          )}
           <div className={cn(
             "grid gap-6 max-w-7xl mx-auto h-full content-center",
             participants.length <= 1 ? "grid-cols-1 max-w-3xl" : 
