@@ -225,9 +225,12 @@ export default function App() {
   const [isVideoOff, setIsVideoOff] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [roomInput, setRoomInput] = useState('');
+  const [isJoining, setIsJoining] = useState(false);
 
   const peerRef = useRef<Peer | null>(null);
   const callsRef = useRef<Record<string, MediaConnection>>({});
+  const unsubscribeRef = useRef<(() => void) | null>(null);
 
   // --- Auth ---
   useEffect(() => {
@@ -267,6 +270,15 @@ export default function App() {
 
   // --- Meeting Logic ---
 
+  useEffect(() => {
+    return () => {
+      // Cleanup on unmount
+      if (unsubscribeRef.current) unsubscribeRef.current();
+      if (peerRef.current) peerRef.current.destroy();
+      localStream?.getTracks().forEach(track => track.stop());
+    };
+  }, [localStream]);
+
   const startMeeting = async () => {
     if (!user) return;
     const roomId = Math.random().toString(36).substring(2, 10);
@@ -285,21 +297,47 @@ export default function App() {
   };
 
   const joinRoom = async (roomId: string) => {
+    if (!roomId.trim()) return;
+    setIsJoining(true);
+    setError(null);
     try {
       let roomSnap;
       try {
         roomSnap = await getDoc(doc(db, 'rooms', roomId));
       } catch (err) {
         handleFirestoreError(err, OperationType.GET, `rooms/${roomId}`);
+        setIsJoining(false);
         return;
       }
       
       if (!roomSnap.exists()) {
-        setError("Room not found.");
+        setError("Room not found. Please check the code.");
+        setIsJoining(false);
         return;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setError("Your browser does not support video calling. Please use a modern browser like Chrome or Firefox.");
+        setIsJoining(false);
+        return;
+      }
+
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      } catch (err: any) {
+        console.error("Media Access Error:", err);
+        if (err.name === 'NotAllowedError') {
+          setError("Camera/Microphone access denied. Please enable permissions in your browser settings.");
+        } else if (err.name === 'NotFoundError') {
+          setError("No camera or microphone found on this device.");
+        } else {
+          setError("Could not access camera/microphone. Please check your hardware.");
+        }
+        setIsJoining(false);
+        return;
+      }
+      
       setLocalStream(stream);
 
       const peer = new Peer();
@@ -322,36 +360,66 @@ export default function App() {
         }
 
         setRoom({ id: roomId, ...roomSnap.data() } as Room);
+        setIsJoining(false);
+      });
+
+      peer.on('error', (err) => {
+        console.error("PeerJS Error:", err);
+        setError(`Connection error: ${err.type}`);
+        setIsJoining(false);
       });
 
       peer.on('call', (call) => {
-        call.answer(stream);
-        call.on('stream', (remoteStream) => {
-          setRemoteStreams(prev => ({ ...prev, [call.peer]: remoteStream }));
-        });
+        console.log(`Receiving call from: ${call.peer}`);
+        try {
+          call.answer(stream);
+          call.on('stream', (remoteStream) => {
+            console.log(`Received stream from caller: ${call.peer}`);
+            setRemoteStreams(prev => ({ ...prev, [call.peer]: remoteStream }));
+          });
+          call.on('error', (err) => {
+            console.error(`Call error with ${call.peer}:`, err);
+          });
+        } catch (err) {
+          console.error("Error answering call:", err);
+        }
       });
 
       // Listen for other participants
       const q = collection(db, 'rooms', roomId, 'participants');
-      onSnapshot(q, (snapshot) => {
-        const parts: Participant[] = [];
-        snapshot.forEach((doc) => {
-          const data = doc.data() as Participant;
-          parts.push({ id: doc.id, ...data });
-          
-          // Call new participants
-          if (data.peerId !== peer.id && !callsRef.current[data.peerId]) {
-            const call = peer.call(data.peerId, stream);
-            call.on('stream', (remoteStream) => {
-              setRemoteStreams(prev => ({ ...prev, [data.peerId]: remoteStream }));
-            });
-            callsRef.current[data.peerId] = call;
-          }
-        });
-        setParticipants(parts);
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        try {
+          const parts: Participant[] = [];
+          snapshot.forEach((doc) => {
+            const data = doc.data() as Participant;
+            parts.push({ id: doc.id, ...data });
+            
+            // Call new participants
+            if (data.peerId !== peer.id && !callsRef.current[data.peerId]) {
+              console.log(`Calling participant: ${data.name} (${data.peerId})`);
+              try {
+                const call = peer.call(data.peerId, stream);
+                call.on('stream', (remoteStream) => {
+                  console.log(`Received stream from: ${data.name}`);
+                  setRemoteStreams(prev => ({ ...prev, [data.peerId]: remoteStream }));
+                });
+                call.on('error', (err) => {
+                  console.error(`Call error with ${data.name}:`, err);
+                });
+                callsRef.current[data.peerId] = call;
+              } catch (err) {
+                console.error(`Error calling ${data.name}:`, err);
+              }
+            }
+          });
+          setParticipants(parts);
+        } catch (err) {
+          console.error("Error in onSnapshot listener:", err);
+        }
       }, (err) => {
         handleFirestoreError(err, OperationType.LIST, `rooms/${roomId}/participants`);
       });
+      unsubscribeRef.current = unsubscribe;
 
     } catch (err) {
       console.error(err);
@@ -361,18 +429,31 @@ export default function App() {
 
   const leaveRoom = async () => {
     if (room && user) {
+      console.log("Leaving room...");
       try {
         await deleteDoc(doc(db, 'rooms', room.id, 'participants', user.uid));
       } catch (err) {
         handleFirestoreError(err, OperationType.DELETE, `rooms/${room.id}/participants/${user.uid}`);
       }
       
+      // Unsubscribe from Firestore
+      if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
+      }
+
       // Stop all tracks
-      localStream?.getTracks().forEach(track => track.stop());
+      localStream?.getTracks().forEach(track => {
+        track.stop();
+        console.log(`Stopped track: ${track.kind}`);
+      });
       setLocalStream(null);
       
       // Close peer connection
-      peerRef.current?.destroy();
+      if (peerRef.current) {
+        peerRef.current.destroy();
+        console.log("Peer connection destroyed");
+      }
       peerRef.current = null;
       
       setRoom(null);
@@ -610,23 +691,51 @@ export default function App() {
               </p>
             </div>
 
-            <div className="flex flex-col sm:flex-row gap-4">
-              <Button onClick={startMeeting} className="h-14 px-8 text-lg">
+            <div className="flex flex-col sm:flex-row gap-4 items-stretch sm:items-center">
+              <Button 
+                onClick={startMeeting} 
+                className="h-14 px-8 text-lg whitespace-nowrap"
+                disabled={isJoining}
+              >
                 <Plus className="w-5 h-5" />
                 New Meeting
               </Button>
               
-              <div className="relative flex-1">
+              <div className="relative flex-1 flex gap-2">
                 <input 
                   type="text" 
                   placeholder="Enter room code"
-                  className="w-full h-14 bg-neutral-900 border border-white/5 rounded-full px-6 text-white placeholder:text-neutral-600 focus:outline-none focus:border-white/20 transition-colors"
+                  value={roomInput}
+                  onChange={(e) => setRoomInput(e.target.value)}
+                  className="flex-1 h-14 bg-neutral-900 border border-white/5 rounded-full px-6 text-white placeholder:text-neutral-600 focus:outline-none focus:border-white/20 transition-colors"
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') joinRoom((e.target as HTMLInputElement).value);
+                    if (e.key === 'Enter') joinRoom(roomInput);
                   }}
                 />
+                <Button 
+                  variant="secondary" 
+                  className="h-14 px-6 rounded-full"
+                  onClick={() => joinRoom(roomInput)}
+                  disabled={!roomInput.trim() || isJoining}
+                >
+                  {isJoining ? (
+                    <div className="w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                  ) : (
+                    "Join"
+                  )}
+                </Button>
               </div>
             </div>
+
+            {error && (
+              <motion.p 
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="text-red-500 text-sm bg-red-500/10 p-4 rounded-xl border border-red-500/20"
+              >
+                {error}
+              </motion.p>
+            )}
           </div>
 
           <div className="hidden md:block relative aspect-square">
