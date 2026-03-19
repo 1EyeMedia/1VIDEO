@@ -228,6 +228,8 @@ export default function App() {
   const [roomInput, setRoomInput] = useState('');
   const [isJoining, setIsJoining] = useState(false);
   const [isPeerConnected, setIsPeerConnected] = useState(false);
+  const [peerError, setPeerError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
   const [localParticipant, setLocalParticipant] = useState<Participant | null>(null);
 
   const peerRef = useRef<Peer | null>(null);
@@ -257,6 +259,132 @@ export default function App() {
     });
     return unsubscribe;
   }, []);
+
+  // --- PeerJS & Connection Management ---
+  useEffect(() => {
+    if (!room || !user || !localStream) return;
+
+    console.log("Initializing PeerJS (retryCount: " + retryCount + ")...");
+    setPeerError(null);
+    setIsPeerConnected(false);
+
+    const peer = new Peer({
+      debug: 3,
+      config: {
+        'iceServers': [
+          { 'urls': 'stun:stun.l.google.com:19302' },
+          { 'urls': 'stun:stun1.l.google.com:19302' },
+          { 'urls': 'stun:stun2.l.google.com:19302' },
+          { 'urls': 'stun:stun3.l.google.com:19302' },
+          { 'urls': 'stun:stun4.l.google.com:19302' },
+        ]
+      }
+    });
+    peerRef.current = peer;
+
+    const peerTimeout = setTimeout(() => {
+      if (!peer.open && !peer.destroyed) {
+        console.error("PeerJS connection timeout");
+        setPeerError("Connection timeout. PeerJS signaling might be blocked by your network or firewall.");
+      }
+    }, 30000);
+
+    peer.on('open', async (id) => {
+      clearTimeout(peerTimeout);
+      console.log("PeerJS opened with ID:", id);
+      setIsPeerConnected(true);
+      setPeerError(null);
+
+      const participantRef = doc(db, 'rooms', room.id, 'participants', user.uid);
+      try {
+        await setDoc(participantRef, {
+          userId: user.uid,
+          peerId: id,
+          name: user.displayName,
+          photoURL: user.photoURL,
+          isMuted: isMuted,
+          isVideoOff: isVideoOff,
+          joinedAt: serverTimestamp()
+        });
+        console.log("Participant registered in Firestore");
+      } catch (err) {
+        console.error("Error registering participant:", err);
+        handleFirestoreError(err, OperationType.WRITE, `rooms/${room.id}/participants/${user.uid}`);
+      }
+    });
+
+    peer.on('error', (err) => {
+      console.error("PeerJS Error:", err);
+      setPeerError(`Connection error: ${err.type}. ${err.message || ""}`);
+      setIsPeerConnected(false);
+    });
+
+    peer.on('call', (call) => {
+      console.log(`Receiving call from: ${call.peer}`);
+      try {
+        call.answer(localStream);
+        call.on('stream', (remoteStream) => {
+          console.log(`Received stream from caller: ${call.peer}`);
+          setRemoteStreams(prev => ({ ...prev, [call.peer]: remoteStream }));
+        });
+        call.on('error', (err) => {
+          console.error(`Call error with ${call.peer}:`, err);
+        });
+      } catch (err) {
+        console.error("Error answering call:", err);
+      }
+    });
+
+    // Listen for other participants
+    const q = collection(db, 'rooms', room.id, 'participants');
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      try {
+        const parts: Participant[] = [];
+        snapshot.forEach((doc) => {
+          const data = doc.data() as Participant;
+          parts.push({ id: doc.id, ...data });
+          
+          // Call new participants
+          if (peer.open && data.peerId && data.peerId !== peer.id && !callsRef.current[data.peerId]) {
+            console.log(`Calling participant: ${data.name} (${data.peerId})`);
+            try {
+              const call = peer.call(data.peerId, localStream);
+              call.on('stream', (remoteStream) => {
+                console.log(`Received stream from: ${data.name}`);
+                setRemoteStreams(prev => ({ ...prev, [data.peerId]: remoteStream }));
+              });
+              call.on('error', (err) => {
+                console.error(`Call error with ${data.name}:`, err);
+              });
+              callsRef.current[data.peerId] = call;
+            } catch (err) {
+              console.error(`Error calling ${data.name}:`, err);
+            }
+          }
+        });
+        setParticipants(parts);
+      } catch (err) {
+        console.error("Error in onSnapshot listener:", err);
+      }
+    }, (err) => {
+      handleFirestoreError(err, OperationType.LIST, `rooms/${room.id}/participants`);
+    });
+
+    return () => {
+      console.log("Cleaning up PeerJS connection...");
+      clearTimeout(peerTimeout);
+      unsubscribe();
+      if (peerRef.current) {
+        peerRef.current.destroy();
+        peerRef.current = null;
+      }
+      // Close all active calls
+      (Object.values(callsRef.current) as MediaConnection[]).forEach(call => call.close());
+      callsRef.current = {};
+      setRemoteStreams({});
+      setIsPeerConnected(false);
+    };
+  }, [room?.id, user?.uid, localStream, retryCount]);
 
   const login = async () => {
     setError(null);
@@ -305,21 +433,22 @@ export default function App() {
   };
 
   const joinRoom = async (roomId: string) => {
-    if (!roomId.trim()) return;
+    if (!user) return;
     setIsJoining(true);
     setError(null);
-    console.log("Attempting to join room:", roomId);
+    setPeerError(null);
 
     try {
-      // 1. Fetch Room Data
-      const roomSnap = await getDoc(doc(db, 'rooms', roomId));
+      // 1. Check if room exists
+      const roomRef = doc(db, 'rooms', roomId);
+      const roomSnap = await getDoc(roomRef);
+      
       if (!roomSnap.exists()) {
-        setError("Room not found. Please check the code.");
+        setError("Room not found. Please check the ID and try again.");
         setIsJoining(false);
         return;
       }
       const roomData = roomSnap.data() as Room;
-      console.log("Room data fetched:", roomData);
 
       // 2. Get User Media
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -343,11 +472,9 @@ export default function App() {
       } catch (err: any) {
         console.error("Media Access Error:", err);
         if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          setError("Camera/Microphone access denied. Please click the camera icon in your browser's address bar and allow access.");
+          setError("Camera/Microphone access denied. Please allow access to join the meeting.");
         } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-          setError("No camera or microphone found. Please connect a device and try again.");
-        } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-          setError("Could not start video source. Your camera might be in use by another application (like Zoom or Teams). Please close other apps and try again.");
+          setError("No camera or microphone found.");
         } else {
           setError(`Media Error: ${err.message || "Could not access camera/microphone"}`);
         }
@@ -357,119 +484,20 @@ export default function App() {
       
       setLocalStream(stream);
 
-      // 3. Set Room State Immediately (Show Interface)
+      // 3. Set Initial State (The useEffect will handle PeerJS)
       const initialLocalParticipant: Participant = {
-        id: user!.uid,
-        userId: user!.uid,
+        id: user.uid,
+        userId: user.uid,
         peerId: '',
-        name: user!.displayName || 'Anonymous',
-        photoURL: user!.photoURL || '',
+        name: user.displayName || 'Anonymous',
+        photoURL: user.photoURL || '',
         isMuted: false,
         isVideoOff: false,
         joinedAt: new Date()
       };
       setLocalParticipant(initialLocalParticipant);
       setRoom({ id: roomId, ...roomData });
-      setIsJoining(false); // Stop buffering on dashboard
-
-      // 4. Initialize PeerJS and Register Participant in Background
-      console.log("Initializing PeerJS...");
-      const peer = new Peer({
-        debug: 3,
-        config: {
-          'iceServers': [
-            { 'urls': 'stun:stun.l.google.com:19302' },
-            { 'urls': 'stun:stun1.l.google.com:19302' },
-          ]
-        }
-      });
-      peerRef.current = peer;
-
-      const peerTimeout = setTimeout(() => {
-        if (!peer.open && !peer.destroyed) {
-          console.error("PeerJS connection timeout");
-          setError("Network connection is taking longer than expected. Please check if your network blocks PeerJS (WebRTC).");
-        }
-      }, 30000);
-
-      peer.on('open', async (id) => {
-        clearTimeout(peerTimeout);
-        console.log("PeerJS opened with ID:", id);
-        setIsPeerConnected(true);
-        const participantRef = doc(db, 'rooms', roomId, 'participants', user!.uid);
-        try {
-          await setDoc(participantRef, {
-            userId: user!.uid,
-            peerId: id,
-            name: user!.displayName,
-            photoURL: user!.photoURL,
-            isMuted: false,
-            isVideoOff: false,
-            joinedAt: serverTimestamp()
-          });
-          console.log("Participant registered in Firestore");
-        } catch (err) {
-          console.error("Error registering participant:", err);
-          handleFirestoreError(err, OperationType.WRITE, `rooms/${roomId}/participants/${user!.uid}`);
-        }
-      });
-
-      peer.on('error', (err) => {
-        console.error("PeerJS Error:", err);
-        setError(`Connection error: ${err.type}. PeerJS signaling might be blocked.`);
-      });
-
-      peer.on('call', (call) => {
-        console.log(`Receiving call from: ${call.peer}`);
-        try {
-          call.answer(stream);
-          call.on('stream', (remoteStream) => {
-            console.log(`Received stream from caller: ${call.peer}`);
-            setRemoteStreams(prev => ({ ...prev, [call.peer]: remoteStream }));
-          });
-          call.on('error', (err) => {
-            console.error(`Call error with ${call.peer}:`, err);
-          });
-        } catch (err) {
-          console.error("Error answering call:", err);
-        }
-      });
-
-      // Listen for other participants
-      const q = collection(db, 'rooms', roomId, 'participants');
-      const unsubscribe = onSnapshot(q, (snapshot) => {
-        try {
-          const parts: Participant[] = [];
-          snapshot.forEach((doc) => {
-            const data = doc.data() as Participant;
-            parts.push({ id: doc.id, ...data });
-            
-            // Call new participants
-            if (data.peerId && data.peerId !== peer.id && !callsRef.current[data.peerId]) {
-              console.log(`Calling participant: ${data.name} (${data.peerId})`);
-              try {
-                const call = peer.call(data.peerId, stream);
-                call.on('stream', (remoteStream) => {
-                  console.log(`Received stream from: ${data.name}`);
-                  setRemoteStreams(prev => ({ ...prev, [data.peerId]: remoteStream }));
-                });
-                call.on('error', (err) => {
-                  console.error(`Call error with ${data.name}:`, err);
-                });
-                callsRef.current[data.peerId] = call;
-              } catch (err) {
-                console.error(`Error calling ${data.name}:`, err);
-              }
-            }
-          });
-          setParticipants(parts);
-        } catch (err) {
-          console.error("Error in onSnapshot listener:", err);
-        }
-      }, (err) => {
-        handleFirestoreError(err, OperationType.LIST, `rooms/${roomId}/participants`);
-      });
-      unsubscribeRef.current = unsubscribe;
+      setIsJoining(false);
 
     } catch (err) {
       console.error("General Join Error:", err);
@@ -479,66 +507,8 @@ export default function App() {
   };
 
   const retryConnection = () => {
-    if (!room || !localStream) return;
-    setError(null);
-    setIsPeerConnected(false);
-    
-    if (peerRef.current) {
-      peerRef.current.destroy();
-    }
-    
-    console.log("Retrying PeerJS connection...");
-    const peer = new Peer({
-      debug: 3,
-      config: {
-        'iceServers': [
-          { 'urls': 'stun:stun.l.google.com:19302' },
-          { 'urls': 'stun:stun1.l.google.com:19302' },
-        ]
-      }
-    });
-    peerRef.current = peer;
-
-    const peerTimeout = setTimeout(() => {
-      if (!peer.open && !peer.destroyed) {
-        setError("Still unable to connect. This might be a network restriction.");
-      }
-    }, 30000);
-
-    peer.on('open', async (id) => {
-      clearTimeout(peerTimeout);
-      setIsPeerConnected(true);
-      const participantRef = doc(db, 'rooms', room.id, 'participants', user!.uid);
-      try {
-        await setDoc(participantRef, {
-          userId: user!.uid,
-          peerId: id,
-          name: user!.displayName,
-          photoURL: user!.photoURL,
-          isMuted: isMuted,
-          isVideoOff: isVideoOff,
-          joinedAt: serverTimestamp()
-        });
-      } catch (err) {
-        handleFirestoreError(err, OperationType.WRITE, `rooms/${room.id}/participants/${user!.uid}`);
-      }
-    });
-
-    peer.on('error', (err) => {
-      console.error("PeerJS Retry Error:", err);
-      setError(`Connection error: ${err.type}`);
-    });
-
-    peer.on('call', (call) => {
-      try {
-        call.answer(localStream);
-        call.on('stream', (remoteStream) => {
-          setRemoteStreams(prev => ({ ...prev, [call.peer]: remoteStream }));
-        });
-      } catch (err) {
-        console.error("Error answering call:", err);
-      }
-    });
+    console.log("Retry button clicked, incrementing retryCount...");
+    setRetryCount(prev => prev + 1);
   };
 
   const leaveRoom = async () => {
@@ -550,12 +520,6 @@ export default function App() {
         handleFirestoreError(err, OperationType.DELETE, `rooms/${room.id}/participants/${user.uid}`);
       }
       
-      // Unsubscribe from Firestore
-      if (unsubscribeRef.current) {
-        unsubscribeRef.current();
-        unsubscribeRef.current = null;
-      }
-
       // Stop all tracks
       localStream?.getTracks().forEach(track => {
         track.stop();
@@ -563,19 +527,11 @@ export default function App() {
       });
       setLocalStream(null);
       
-      // Close peer connection
-      if (peerRef.current) {
-        peerRef.current.destroy();
-        console.log("Peer connection destroyed");
-      }
-      peerRef.current = null;
-      
+      // PeerJS cleanup is handled by useEffect cleanup
       setRoom(null);
       setParticipants([]);
-      setLocalParticipant(null);
       setRemoteStreams({});
-      setIsPeerConnected(false);
-      callsRef.current = {};
+      setLocalParticipant(null);
     }
   };
 
@@ -745,18 +701,27 @@ export default function App() {
 
           {!isPeerConnected && (
             <div className="fixed bottom-24 right-8 z-50">
-              <div className="bg-black/80 backdrop-blur-md border border-white/10 px-4 py-2 rounded-2xl flex items-center gap-4 shadow-2xl">
-                <div className="flex items-center gap-3">
-                  <div className="w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-                  <span className="text-[10px] uppercase tracking-widest text-neutral-400">Connecting...</span>
+              <div className="bg-black/80 backdrop-blur-md border border-white/10 px-4 py-2 rounded-2xl flex flex-col gap-2 shadow-2xl min-w-[200px]">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                    <span className="text-[10px] uppercase tracking-widest text-neutral-400">
+                      {peerError ? "Connection Failed" : "Connecting..."}
+                    </span>
+                  </div>
+                  <Button 
+                    variant="ghost" 
+                    className="h-7 px-3 text-[10px] uppercase tracking-widest hover:bg-white/5 text-white"
+                    onClick={retryConnection}
+                  >
+                    Retry
+                  </Button>
                 </div>
-                <Button 
-                  variant="ghost" 
-                  className="h-7 px-3 text-[10px] uppercase tracking-widest hover:bg-white/5"
-                  onClick={retryConnection}
-                >
-                  Retry
-                </Button>
+                {peerError && (
+                  <p className="text-[9px] text-red-400 leading-tight border-t border-white/5 pt-2">
+                    {peerError}
+                  </p>
+                )}
               </div>
             </div>
           )}
