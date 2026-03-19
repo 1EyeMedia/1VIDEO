@@ -228,6 +228,7 @@ export default function App() {
   const [roomInput, setRoomInput] = useState('');
   const [isJoining, setIsJoining] = useState(false);
   const [isPeerConnected, setIsPeerConnected] = useState(false);
+  const [localParticipant, setLocalParticipant] = useState<Participant | null>(null);
 
   const peerRef = useRef<Peer | null>(null);
   const callsRef = useRef<Record<string, MediaConnection>>({});
@@ -357,21 +358,39 @@ export default function App() {
       setLocalStream(stream);
 
       // 3. Set Room State Immediately (Show Interface)
+      const initialLocalParticipant: Participant = {
+        id: user!.uid,
+        userId: user!.uid,
+        peerId: '',
+        name: user!.displayName || 'Anonymous',
+        photoURL: user!.photoURL || '',
+        isMuted: false,
+        isVideoOff: false,
+        joinedAt: new Date()
+      };
+      setLocalParticipant(initialLocalParticipant);
       setRoom({ id: roomId, ...roomData });
       setIsJoining(false); // Stop buffering on dashboard
 
       // 4. Initialize PeerJS and Register Participant in Background
       console.log("Initializing PeerJS...");
-      const peer = new Peer();
+      const peer = new Peer({
+        debug: 3,
+        config: {
+          'iceServers': [
+            { 'urls': 'stun:stun.l.google.com:19302' },
+            { 'urls': 'stun:stun1.l.google.com:19302' },
+          ]
+        }
+      });
       peerRef.current = peer;
 
       const peerTimeout = setTimeout(() => {
-        if (!peer.open) {
+        if (!peer.open && !peer.destroyed) {
           console.error("PeerJS connection timeout");
-          setError("Connection timeout. Please check your internet connection.");
-          // Don't leave room, just show error
+          setError("Network connection is taking longer than expected. Please check if your network blocks PeerJS (WebRTC).");
         }
-      }, 15000);
+      }, 30000);
 
       peer.on('open', async (id) => {
         clearTimeout(peerTimeout);
@@ -459,6 +478,69 @@ export default function App() {
     }
   };
 
+  const retryConnection = () => {
+    if (!room || !localStream) return;
+    setError(null);
+    setIsPeerConnected(false);
+    
+    if (peerRef.current) {
+      peerRef.current.destroy();
+    }
+    
+    console.log("Retrying PeerJS connection...");
+    const peer = new Peer({
+      debug: 3,
+      config: {
+        'iceServers': [
+          { 'urls': 'stun:stun.l.google.com:19302' },
+          { 'urls': 'stun:stun1.l.google.com:19302' },
+        ]
+      }
+    });
+    peerRef.current = peer;
+
+    const peerTimeout = setTimeout(() => {
+      if (!peer.open && !peer.destroyed) {
+        setError("Still unable to connect. This might be a network restriction.");
+      }
+    }, 30000);
+
+    peer.on('open', async (id) => {
+      clearTimeout(peerTimeout);
+      setIsPeerConnected(true);
+      const participantRef = doc(db, 'rooms', room.id, 'participants', user!.uid);
+      try {
+        await setDoc(participantRef, {
+          userId: user!.uid,
+          peerId: id,
+          name: user!.displayName,
+          photoURL: user!.photoURL,
+          isMuted: isMuted,
+          isVideoOff: isVideoOff,
+          joinedAt: serverTimestamp()
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, `rooms/${room.id}/participants/${user!.uid}`);
+      }
+    });
+
+    peer.on('error', (err) => {
+      console.error("PeerJS Retry Error:", err);
+      setError(`Connection error: ${err.type}`);
+    });
+
+    peer.on('call', (call) => {
+      try {
+        call.answer(localStream);
+        call.on('stream', (remoteStream) => {
+          setRemoteStreams(prev => ({ ...prev, [call.peer]: remoteStream }));
+        });
+      } catch (err) {
+        console.error("Error answering call:", err);
+      }
+    });
+  };
+
   const leaveRoom = async () => {
     if (room && user) {
       console.log("Leaving room...");
@@ -490,6 +572,7 @@ export default function App() {
       
       setRoom(null);
       setParticipants([]);
+      setLocalParticipant(null);
       setRemoteStreams({});
       setIsPeerConnected(false);
       callsRef.current = {};
@@ -619,22 +702,30 @@ export default function App() {
 
         {/* Video Grid */}
         <main className="flex-1 p-6 overflow-y-auto relative">
-          {!isPeerConnected && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-              <div className="text-center space-y-4">
-                <div className="w-12 h-12 border-4 border-white/10 border-t-white rounded-full animate-spin mx-auto" />
-                <p className="text-sm text-neutral-400 animate-pulse">Establishing secure connection...</p>
-              </div>
-            </div>
-          )}
           <div className={cn(
             "grid gap-6 max-w-7xl mx-auto h-full content-center",
-            participants.length <= 1 ? "grid-cols-1 max-w-3xl" : 
-            participants.length <= 2 ? "grid-cols-1 md:grid-cols-2" :
-            participants.length <= 4 ? "grid-cols-2" :
+            (participants.length + (localParticipant ? 1 : 0)) <= 1 ? "grid-cols-1 max-w-3xl" : 
+            (participants.length + (localParticipant ? 1 : 0)) <= 2 ? "grid-cols-1 md:grid-cols-2" :
+            (participants.length + (localParticipant ? 1 : 0)) <= 4 ? "grid-cols-2" :
             "grid-cols-2 lg:grid-cols-3"
           )}>
             <AnimatePresence>
+              {/* Local Participant */}
+              {localParticipant && !participants.find(p => p.userId === user.uid) && (
+                <motion.div
+                  key="local-temp"
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                >
+                  <VideoTile 
+                    participant={localParticipant} 
+                    stream={localStream} 
+                    isLocal={true}
+                  />
+                </motion.div>
+              )}
+
+              {/* All Participants (including local once synced) */}
               {participants.map((p) => (
                 <motion.div
                   key={p.id}
@@ -651,6 +742,24 @@ export default function App() {
               ))}
             </AnimatePresence>
           </div>
+
+          {!isPeerConnected && (
+            <div className="fixed bottom-24 right-8 z-50">
+              <div className="bg-black/80 backdrop-blur-md border border-white/10 px-4 py-2 rounded-2xl flex items-center gap-4 shadow-2xl">
+                <div className="flex items-center gap-3">
+                  <div className="w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                  <span className="text-[10px] uppercase tracking-widest text-neutral-400">Connecting...</span>
+                </div>
+                <Button 
+                  variant="ghost" 
+                  className="h-7 px-3 text-[10px] uppercase tracking-widest hover:bg-white/5"
+                  onClick={retryConnection}
+                >
+                  Retry
+                </Button>
+              </div>
+            </div>
+          )}
         </main>
 
         {/* Controls */}
@@ -720,50 +829,52 @@ export default function App() {
       </header>
 
       <main className="flex-1 flex flex-col items-center justify-center p-6">
-        <div className="max-w-4xl w-full grid md:grid-cols-2 gap-12 items-center">
-          <div className="space-y-8">
-            <div className="space-y-4">
-              <h2 className="text-6xl font-light leading-tight tracking-tighter">
-                Connect <br />
-                <span className="text-neutral-500 italic">Everywhere.</span>
-              </h2>
-              <p className="text-neutral-400 max-w-sm leading-relaxed">
-                Experience crystal clear video and audio in a private, secure environment designed for professionals.
-              </p>
-            </div>
+        <div className="max-w-2xl w-full text-center space-y-12">
+          <div className="space-y-6">
+            <h2 className="text-6xl sm:text-7xl font-light leading-tight tracking-tighter">
+              Connect <br />
+              <span className="text-neutral-500 italic">Everywhere.</span>
+            </h2>
+            <p className="text-neutral-400 max-w-md mx-auto leading-relaxed">
+              Experience crystal clear video and audio in a private, secure environment designed for professionals.
+            </p>
+          </div>
 
-            <div className="flex flex-col sm:flex-row gap-4 items-stretch sm:items-center">
+          <div className="space-y-6">
+            <div className="flex flex-col sm:flex-row gap-4 items-stretch justify-center">
               <Button 
                 onClick={startMeeting} 
-                className="h-14 px-8 text-lg whitespace-nowrap"
+                className="h-16 px-10 text-xl whitespace-nowrap"
                 disabled={isJoining}
               >
-                <Plus className="w-5 h-5" />
-                New Meeting
+                {isJoining ? (
+                   <div className="w-6 h-6 border-2 border-black/20 border-t-black rounded-full animate-spin" />
+                ) : (
+                  <>
+                    <Plus className="w-6 h-6" />
+                    New Meeting
+                  </>
+                )}
               </Button>
               
-              <div className="relative flex-1 flex gap-2">
+              <div className="relative flex gap-2 min-w-[300px]">
                 <input 
                   type="text" 
                   placeholder="Enter room code"
                   value={roomInput}
                   onChange={(e) => setRoomInput(e.target.value)}
-                  className="flex-1 h-14 bg-neutral-900 border border-white/5 rounded-full px-6 text-white placeholder:text-neutral-600 focus:outline-none focus:border-white/20 transition-colors"
+                  className="flex-1 h-16 bg-neutral-900 border border-white/10 rounded-2xl px-6 text-white placeholder:text-neutral-600 focus:outline-none focus:border-white/30 transition-colors text-lg"
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') joinRoom(roomInput);
                   }}
                 />
                 <Button 
                   variant="secondary" 
-                  className="h-14 px-6 rounded-full"
+                  className="h-16 px-8 rounded-2xl text-lg"
                   onClick={() => joinRoom(roomInput)}
                   disabled={!roomInput.trim() || isJoining}
                 >
-                  {isJoining ? (
-                    <div className="w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-                  ) : (
-                    "Join"
-                  )}
+                  Join
                 </Button>
               </div>
             </div>
@@ -772,23 +883,11 @@ export default function App() {
               <motion.p 
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="text-red-500 text-sm bg-red-500/10 p-4 rounded-xl border border-red-500/20"
+                className="text-red-500 text-sm bg-red-500/10 p-4 rounded-xl border border-red-500/20 max-w-md mx-auto"
               >
                 {error}
               </motion.p>
             )}
-          </div>
-
-          <div className="hidden md:block relative aspect-square">
-            <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent rounded-full blur-3xl" />
-            <div className="relative h-full w-full border border-white/5 rounded-3xl overflow-hidden bg-neutral-900/50 backdrop-blur-sm flex items-center justify-center">
-               <div className="text-center space-y-4">
-                  <div className="w-24 h-24 bg-neutral-800 rounded-full mx-auto flex items-center justify-center border border-white/10">
-                    <Users className="w-10 h-10 text-neutral-500" />
-                  </div>
-                  <p className="text-xs text-neutral-500 uppercase tracking-[0.2em]">Ready to join</p>
-               </div>
-            </div>
           </div>
         </div>
       </main>
