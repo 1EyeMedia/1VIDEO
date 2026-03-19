@@ -324,18 +324,41 @@ export default function App() {
 
       let stream: MediaStream;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            facingMode: "user"
+          }, 
+          audio: true 
+        });
       } catch (err: any) {
         console.error("Media Access Error:", err);
-        if (err.name === 'NotAllowedError') {
-          setError("Camera/Microphone access denied. Please enable permissions in your browser settings.");
-        } else if (err.name === 'NotFoundError') {
-          setError("No camera or microphone found on this device.");
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+          setError("Camera/Microphone access denied. Please click the camera icon in your browser's address bar and allow access.");
+        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+          setError("No camera or microphone found. Please connect a device and try again.");
+        } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+          setError("Could not start video source. Your camera might be in use by another application (like Zoom or Teams). Please close other apps and try again.");
+        } else if (err.name === 'OverconstrainedError') {
+          setError("Your camera does not support the required resolution. Trying with default settings...");
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+            setLocalStream(stream);
+            // Continue with the rest of the logic...
+          } catch (fallbackErr) {
+            setError("Could not access camera even with default settings.");
+            setIsJoining(false);
+            return;
+          }
         } else {
-          setError("Could not access camera/microphone. Please check your hardware.");
+          setError(`Media Error: ${err.message || "Could not access camera/microphone"}`);
         }
-        setIsJoining(false);
-        return;
+        
+        if (!stream!) {
+          setIsJoining(false);
+          return;
+        }
       }
       
       setLocalStream(stream);
